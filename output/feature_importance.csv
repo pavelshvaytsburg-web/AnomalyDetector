@@ -1,0 +1,9 @@
+feature,importance
+duration,0.004207060301032375
+protocol,0.00159441701632152
+bytes_per_packet,0.0011771643995381084
+packet_count,0.0008548344213225409
+source_port,0.0
+destination_port,0.0
+bytes_sent,0.0
+bytes_received,0.0
