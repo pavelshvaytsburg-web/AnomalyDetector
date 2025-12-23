@@ -1,168 +1,144 @@
 import argparse
 import os
-import numpy as np
+
 import pandas as pd
 
 from modules.data_loader import load_data
 from modules.model import (
     train_isolation_forest,
-    detect_anomalies_scores,
+    anomaly_scores,
     detect_anomalies_custom,
-    build_results_dataframe
+    build_results_dataframe,
 )
-from modules.frequency_analysis import frequency_analysis
-from modules.permutation_importance import permutation_importance_unsupervised
-from modules.visualization import plot_anomaly_scores, plot_packets_vs_bytes
-
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill
+from modules.frequency_analysis import add_frequency_features
+from modules.evaluation import compute_metrics
 
 
-# =============================================
-# РУССКИЕ НАЗВАНИЯ СТОЛБЦОВ
-# =============================================
-COLUMN_MAP = {
-    "source_port": "Исходный порт",
-    "destination_port": "Порт назначения",
-    "protocol": "Протокол",
-    "duration": "Длительность (сек)",
-    "packet_count": "Кол-во пакетов",
-    "bytes_sent": "Отправлено (байт)",
-    "bytes_received": "Получено (байт)",
-    "bytes_per_packet": "Средний размер пакета",
-    "anomaly_score": "Оценка аномальности",
-    "anomaly_label": "Метка модели",
-    "freq_count": "Частота появления",
-    "rarity_flag": "Редкость",
-    "final_anomaly": "Итоговая аномалия",
-    "comment": "Комментарий"
-}
-
-
-# =============================================
-# ГЕНЕРАЦИЯ КОММЕНТАРИЯ
-# =============================================
-def generate_comment(row):
-    reasons = []
-
-    if row["anomaly_score"] < -0.05:
-        reasons.append("низкая оценка anomaly_score")
-
-    if row["rarity_flag"]:
-        reasons.append("редкий тип трафика")
-
-    if row["bytes_sent"] > 100000:
-        reasons.append("большой объём исходящих данных")
-
-    if row["bytes_per_packet"] > 300:
-        reasons.append("крупный средний размер пакета")
-
-    if row["duration"] > 10:
-        reasons.append("длительное соединение")
-
-    if not reasons:
-        return "Параметры заметно отклоняются от нормы"
-
-    return "; ".join(reasons)
-
-
-# =============================================
-# СОХРАНЕНИЕ EXCEL ОТЧЁТА
-# =============================================
-def save_excel_report(df: pd.DataFrame, output_path: str):
-
-    df = df.copy()
-    df["comment"] = df.apply(generate_comment, axis=1)
-
-    df_ru = df.rename(columns=COLUMN_MAP)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Аномалии"
-
-    # Заголовки
-    ws.append(list(df_ru.columns))
-
-    # Цвета
-    red_fill = PatternFill(start_color="FFB3B3", end_color="FFB3B3", fill_type="solid")
-    green_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
-
-    # Строки
-    for idx, row in df_ru.iterrows():
-        ws.append(list(row.values))
-        excel_row = idx + 2
-
-        fill = red_fill if row["Итоговая аномалия"] == 1 else green_fill
-        for cell in ws[excel_row]:
-            cell.fill = fill
-
-    wb.save(output_path)
-    print(f"[INFO] Excel отчёт сохранён: {output_path}")
-
-
-# =============================================
-# ОСНОВНАЯ ФУНКЦИЯ
-# =============================================
 def main():
-    parser = argparse.ArgumentParser(description="Unsupervised ML Anomaly Detector")
+    parser = argparse.ArgumentParser(description="Unsupervised ML Anomaly Detector (simple, tuning-focused)")
     parser.add_argument("--input", type=str, required=True)
     parser.add_argument("--output", type=str, default="output")
-    args = parser.parse_args()
 
+    # Частотный анализ
+    parser.add_argument("--window", type=int, default=1, help="окно частотного анализа в минутах (1/5)")
+    parser.add_argument(
+        "--freq_key",
+        choices=["dst_port", "dst_port_proto"],
+        default="dst_port",
+        help="какая сигнатура используется для частотного анализа",
+    )
+    parser.add_argument("--rarity_q", type=float, default=0.05, help="квантиль редкости (например 0.05)")
+    parser.add_argument("--burst_q", type=float, default=0.99, help="квантиль всплеска (например 0.99)")
+
+    # Порог IF
+    parser.add_argument("--p", type=float, default=15.0, help="перцентиль для порога score_samples (например 10/15/20)")
+    parser.add_argument(
+        "--thr_combine",
+        choices=["strict", "lenient"],
+        default="lenient",
+        help="как объединять перцентильный порог и IQR: strict=min (меньше срабатываний), lenient=max (больше)",
+    )
+
+    # Как комбинировать IF и частотный слой
+    parser.add_argument(
+        "--combine_rule",
+        choices=["if_only", "freq_only", "and", "or"],
+        default="or",
+        help="итоговое правило: IF, Frequency, AND или OR",
+    )
+
+    parser.add_argument("--random_state", type=int, default=42)
+
+    # Пока фокусируемся на качестве — отчёты/картинки отключены
+    parser.add_argument(
+        "--save_details",
+        action="store_true",
+        help="если указано — сохраняем anomaly_results.csv для отладки (Excel/картинки всё равно не строим)",
+    )
+
+    args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    print(os.getcwd())
-    print("Expecting file:", args.input)
+    # 1) Загрузка + стандартизация
+    df_base, X_scaled, _ = load_data(args.input, require_base=True)
+    print(f"[INFO] Загружено строк: {len(df_base)}")
 
-    # 1. ЗАГРУЗКА
-    df_features, X_scaled, scaler = load_data(args.input)
-    print(f"[INFO] Загружено строк: {len(df_features)}")
+    # 2) Обучение Isolation Forest (без учителя)
+    model = train_isolation_forest(X_scaled, random_state=args.random_state)
 
-    # 2. ОБУЧЕНИЕ IF
-    model = train_isolation_forest(X_scaled)
+    # 3) Оценки аномальности
+    scores = anomaly_scores(model, X_scaled)
 
-    # 3. SCORE
-    scores = detect_anomalies_scores(model, X_scaled)
+    # 4) Порог аномальности (перцентиль + IQR)
+    labels, final_thr, p_thr, iqr_thr = detect_anomalies_custom(
+        scores,
+        p=args.p,
+        iqr_k=1.5,
+        combine=args.thr_combine,
+    )
 
-    # 4. АНОМАЛИИ ПО THRESHOLD + IQR
-    labels, final_thr, p_thr, iqr_thr = detect_anomalies_custom(scores)
+    # после этой строки у нас появляется таблица, где уже есть и исходные поля трафика, и результат IF (anomaly_score, anomaly_label).
+    df_results = build_results_dataframe(df_base, scores, labels)
 
-    df_results = build_results_dataframe(df_features, scores, labels)
+    # 5) Частотные признаки + окно времени
+    if args.freq_key == "dst_port":
+        key_cols = ["destination_port"]
+    else:
+        key_cols = ["destination_port", "protocol"]
 
-    # 5. ЧАСТОТНЫЙ АНАЛИЗ
-    df_results = frequency_analysis(df_results)
+    df_results = add_frequency_features(
+        df_results,
+        window_minutes=args.window,
+        key_columns=key_cols,
+        rarity_q=args.rarity_q,
+        burst_q=args.burst_q,
+    )
 
-    df_results["final_anomaly"] = (
-        (df_results["anomaly_label"] == -1) &
-        (df_results["rarity_flag"])
-    ).astype(int)
+    # Базовые предикты
+    pred_if = (df_results["anomaly_label"] == -1).astype(int) # Перевод -1/1 --> True/False --> 1/0, где 0 - норма, 1 - аномалия
+    pred_freq = (df_results["rarity_flag"] | df_results["burst_flag"]).astype(int) # Логическое или между arity_flag и burst_flag --> 1/0, где 0 - норма, 1 - аномалия
 
-    # 6. ВАЖНОСТЬ ПРИЗНАКОВ
-    importance_df = permutation_importance_unsupervised(model, df_features)
-    importance_path = os.path.join(args.output, "feature_importance.csv")
-    importance_df.to_csv(importance_path, index=False)
-    print(f"[INFO] Feature importance сохранён: {importance_path}")
+    # Итог по выбранному правилу
+    if args.combine_rule == "if_only":
+        pred_final = pred_if
+    elif args.combine_rule == "freq_only":
+        pred_final = pred_freq
+    elif args.combine_rule == "and":
+        pred_final = (pred_if & pred_freq).astype(int)
+    else:
+        pred_final = (pred_if | pred_freq).astype(int)
 
-    # 7. СОХРАНЕНИЕ CSV
-    csv_path = os.path.join(args.output, "anomaly_results.csv")
-    df_results.to_csv(csv_path, index=False)
-    print(f"[INFO] CSV сохранён: {csv_path}")
+    df_results["final_anomaly"] = pred_final # Финальная метка
 
-    # 8. EXCEL ОТЧЁТ
-    excel_path = os.path.join(args.output, "anomaly_report.xlsx")
-    save_excel_report(df_results, excel_path)
+    # 6) Метрики качества по label (если есть)
+    if "label" in df_results.columns:
+        y_true = df_results["label"].astype(int).values
 
-    # 9. ВИЗУАЛИЗАЦИЯ
-    hist_path = os.path.join(args.output, "anomaly_scores_hist.png")
-    scatter_path = os.path.join(args.output, "packets_vs_bytes.png")
+        m_if = compute_metrics(y_true, pred_if.values)
+        m_if["method"] = "isolation_forest_only"
 
-    plot_anomaly_scores(df_results, hist_path)
-    plot_packets_vs_bytes(df_results, scatter_path)
+        m_freq = compute_metrics(y_true, pred_freq.values)
+        m_freq["method"] = f"frequency_only({args.freq_key})"
 
-    print(f"[INFO] Гистограмма сохранена: {hist_path}")
-    print(f"[INFO] Scatter plot сохранён: {scatter_path}")
+        m_final = compute_metrics(y_true, pred_final.values)
+        m_final["method"] = f"final({args.combine_rule})"
 
-    print("[INFO] Работа завершена.")
+        metrics_df = pd.DataFrame([m_if, m_freq, m_final])
+        metrics_path = os.path.join(args.output, "metrics.csv")
+        metrics_df.to_csv(metrics_path, index=False)
+
+        print("[INFO] Метрики качества сохранены:", metrics_path)
+        print("[INFO] IF-only:", {k: v for k, v in m_if.items() if k != "method"})
+        print("[INFO] Freq-only:", {k: v for k, v in m_freq.items() if k != "method"})
+        print("[INFO] Final:", {k: v for k, v in m_final.items() if k != "method"})
+
+    # 7) Детальные результаты — только если явно попросили
+    if args.save_details:
+        csv_path = os.path.join(args.output, "anomaly_results.csv")
+        df_results.to_csv(csv_path, index=False)
+        print(f"[INFO] CSV сохранён: {csv_path}")
+
+    print("[OK] Готово.")
 
 
 if __name__ == "__main__":
