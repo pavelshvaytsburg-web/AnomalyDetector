@@ -44,8 +44,6 @@ def compute_metrics(y_true, y_pred) -> dict:
 
     # F1-score: гармоническое среднее precision и recall.
     # Формула: 2 * precision * recall / (precision + recall)
-    # zero_division=0: если precision+recall=0 (например модель всё предсказала как 0),
-    # возвращаем 0.
     f1 = f1_score(y_true, y_pred, zero_division=0)
 
     # Матрица ошибок (confusion matrix) в фиксированном порядке классов [0, 1]:
