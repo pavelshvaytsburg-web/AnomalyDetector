@@ -1,0 +1,8 @@
+Input: ./data/network_traffic.csv
+Config: combine_rule=or, p=10.0, thr_combine=lenient, window=5, freq_key=dst_port, rarity_q=0.05, burst_q=0.99
+Thresholds: p_thr=-0.556952, iqr_thr=-0.507982, final_thr=-0.507982
+
+ precision  recall     f1  false_positive_rate   tp  fp   tn  fn                   method
+    0.9793  0.6150 0.7555               0.0032 1233  26 7974 772    isolation_forest_only
+    0.9326  0.6070 0.7353               0.0110 1217  88 7912 788 frequency_only(dst_port)
+    0.9321  0.7805 0.8496               0.0142 1565 114 7886 440                final(or)

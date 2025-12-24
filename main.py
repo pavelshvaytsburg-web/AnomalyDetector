@@ -1,6 +1,7 @@
 import argparse
 import os
 
+import numpy as np
 import pandas as pd
 
 from modules.data_loader import load_data
@@ -12,6 +13,7 @@ from modules.model import (
 )
 from modules.frequency_analysis import add_frequency_features
 from modules.evaluation import compute_metrics
+from modules.visualization import generate_all_plots
 
 
 def main():
@@ -25,21 +27,21 @@ def main():
         "--freq_key",
         choices=["dst_port", "dst_port_proto"],
         default="dst_port",
-        help="какая сигнатура используется для частотного анализа",
+        help="какой ключ использовать для частот: dst_port или dst_port+protocol",
     )
-    parser.add_argument("--rarity_q", type=float, default=0.05, help="квантиль редкости (например 0.05)")
-    parser.add_argument("--burst_q", type=float, default=0.99, help="квантиль всплеска (например 0.99)")
+    parser.add_argument("--rarity_q", type=float, default=0.05, help="квантиль редкости (ниже — редкое)")
+    parser.add_argument("--burst_q", type=float, default=0.99, help="квантиль всплеска (выше — всплеск)")
 
-    # Порог IF
-    parser.add_argument("--p", type=float, default=15.0, help="перцентиль для порога score_samples (например 10/15/20)")
+    # Порог по Isolation Forest
+    parser.add_argument("--p", type=float, default=0.02, help="перцентиль для порога аномальности (нижний хвост)")
     parser.add_argument(
         "--thr_combine",
         choices=["strict", "lenient"],
-        default="lenient",
-        help="как объединять перцентильный порог и IQR: strict=min (меньше срабатываний), lenient=max (больше)",
+        default="strict",
+        help="как комбинировать p-порог и IQR-порог (strict=min, lenient=max)",
     )
 
-    # Как комбинировать IF и частотный слой
+    # Итоговое правило объединения IF и Frequency
     parser.add_argument(
         "--combine_rule",
         choices=["if_only", "freq_only", "and", "or"],
@@ -49,11 +51,11 @@ def main():
 
     parser.add_argument("--random_state", type=int, default=42)
 
-    # Пока фокусируемся на качестве — отчёты/картинки отключены
+    # Визуализация одним флагом
     parser.add_argument(
-        "--save_details",
+        "--plots",
         action="store_true",
-        help="если указано — сохраняем anomaly_results.csv для отладки (Excel/картинки всё равно не строим)",
+        help="если указано — сохраняем набор графиков в папку <output>/plots",
     )
 
     args = parser.parse_args()
@@ -62,6 +64,16 @@ def main():
     # 1) Загрузка + стандартизация
     df_base, X_scaled, _ = load_data(args.input, require_base=True)
     print(f"[INFO] Загружено строк: {len(df_base)}")
+
+    def _metrics_to_text_table(metrics_df: pd.DataFrame) -> str:
+        # Чуть аккуратнее печать float-метрик
+        dfp = metrics_df.copy()
+        for col in dfp.columns:
+            if col == "method":
+                continue
+            if np.issubdtype(dfp[col].dtype, np.floating):
+                dfp[col] = dfp[col].round(4)
+        return dfp.to_string(index=False)
 
     # 2) Обучение Isolation Forest (без учителя)
     model = train_isolation_forest(X_scaled, random_state=args.random_state)
@@ -77,7 +89,6 @@ def main():
         combine=args.thr_combine,
     )
 
-    # после этой строки у нас появляется таблица, где уже есть и исходные поля трафика, и результат IF (anomaly_score, anomaly_label).
     df_results = build_results_dataframe(df_base, scores, labels)
 
     # 5) Частотные признаки + окно времени
@@ -108,7 +119,8 @@ def main():
     else:
         pred_final = (pred_if | pred_freq).astype(int)
 
-    df_results["final_anomaly"] = pred_final # Финальная метка
+    df_results["final_anomaly"] = pred_final
+
 
     # 6) Метрики качества по label (если есть)
     if "label" in df_results.columns:
@@ -123,23 +135,42 @@ def main():
         m_final = compute_metrics(y_true, pred_final.values)
         m_final["method"] = f"final({args.combine_rule})"
 
-        metrics_df = pd.DataFrame([m_if, m_freq, m_final])
-        metrics_path = os.path.join(args.output, "metrics.csv")
-        metrics_df.to_csv(metrics_path, index=False)
+        rows = [m_if, m_freq, m_final]
 
-        print("[INFO] Метрики качества сохранены:", metrics_path)
+        metrics_df = pd.DataFrame(rows)
+
+        # Метрики сохраняем в читабельном виде (таблица), без CSV
+        metrics_txt_path = os.path.join(args.output, "metrics.txt")
+        table = _metrics_to_text_table(metrics_df)
+        with open(metrics_txt_path, "w", encoding="utf-8") as f:
+            f.write(f"Input: {args.input}\n")
+            f.write(
+                "Config: "
+                f"combine_rule={args.combine_rule}, p={args.p}, thr_combine={args.thr_combine}, "
+                f"window={args.window}, freq_key={args.freq_key}, rarity_q={args.rarity_q}, burst_q={args.burst_q}\n"
+            )
+            f.write(f"Thresholds: p_thr={p_thr:.6f}, iqr_thr={iqr_thr:.6f}, final_thr={final_thr:.6f}\n\n")
+            f.write(table + "\n")
+            
+        print("[INFO] Метрики качества сохранены:", metrics_txt_path)
+        print(table)
+
         print("[INFO] IF-only:", {k: v for k, v in m_if.items() if k != "method"})
         print("[INFO] Freq-only:", {k: v for k, v in m_freq.items() if k != "method"})
         print("[INFO] Final:", {k: v for k, v in m_final.items() if k != "method"})
 
-    # 7) Детальные результаты — только если явно попросили
-    if args.save_details:
-        csv_path = os.path.join(args.output, "anomaly_results.csv")
-        df_results.to_csv(csv_path, index=False)
-        print(f"[INFO] CSV сохранён: {csv_path}")
 
-    print("[OK] Готово.")
-
+    # 8) Визуализация
+    if args.plots:
+        plots_dir = generate_all_plots(
+            df_results,
+            output_dir=args.output,
+            final_thr=final_thr,
+            p_thr=p_thr,
+            iqr_thr=iqr_thr,
+            window_minutes=args.window,  # чтобы таймлайн был согласован с частотным окном
+        )
+        print(f"[INFO] Графики сохранены в: {plots_dir}")
 
 if __name__ == "__main__":
     main()
